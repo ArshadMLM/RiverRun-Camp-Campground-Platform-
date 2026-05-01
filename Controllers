@@ -1,0 +1,183 @@
+const campground = require('../models/campground');
+const Campground = require('../models/campground');
+const { cloudinary } = require('../cloudinary');
+const maptilerClient = require("@maptiler/client");
+
+
+maptilerClient.config.apiKey = process.env.MAPTILER_API_KEY;
+
+module.exports.index = async (req, res) => {
+    const campgrounds = await Campground.find({});
+    res.render('campgrounds/index', { campgrounds });
+}
+
+module.exports.createCampground = async (req, res, next) => {
+
+    const geoData = await maptilerClient.geocoding.forward(req.body.campground.location, { limit: 1 });
+    // console.log(geoData);
+    if (!geoData.features?.length) {
+        req.flash('error', 'Could not geocode that location. Please try again and enter a valid location.');
+        return res.redirect('/campgrounds/new');
+    }
+
+    const newCampground = new Campground(req.body.campground);
+
+    newCampground.geometry = geoData.features[0].geometry; // Add geometry data to the campground
+    newCampground.location = geoData.features[0].place_name; // Standardize location name
+
+    newCampground.images = req.files.map(f => ({url: f.path, filename: f.filename}));
+    newCampground.author = req.user._id; // Associate the logged-in user as the author (passport.js)
+    await newCampground.save();
+    // console.log(newCampground);
+    req.flash('success', 'Successfully made a new campground!');
+    res.redirect(`/campgrounds/${newCampground._id}`);
+}
+
+module.exports.renderNewForm = (req, res) => {
+    res.render('campgrounds/new');
+}
+
+module.exports.showCamground = async (req, res) => {
+    const campground = await Campground.findById(req.params.id).populate(
+        {path:'reviews',
+            populate: {
+                path: 'author'
+            }
+        }).populate('author');
+    if (!campground) {
+        req.flash('error', 'Cannot find that campground!');
+        return res.redirect('/campgrounds');
+    }
+    res.render('campgrounds/show', { campground });
+}
+
+module.exports.renderEditForm = async (req, res) => {
+    const { id } = req.params;
+    const campground = await Campground.findById(id);
+    if (!campground) {
+        req.flash('error', 'Cannot find that campground!');
+        return res.redirect('/campgrounds');
+    }
+    res.render('campgrounds/edit', { campground });
+}
+
+module.exports.updateCampground = async (req, res) => {
+    const { id } = req.params;
+    // console.log(req.body);
+    const geoData = await maptilerClient.geocoding.forward(req.body.campground.location, { limit: 1 });
+    // console.log(geoData);
+    if (!geoData.features?.length) {
+        req.flash('error', 'Could not geocode that location. Please try again and enter a valid location.');
+        return res.redirect(`/campgrounds/${id}/edit`);
+    }
+    const campground = await Campground.findByIdAndUpdate(id, { ...req.body.campground });
+
+    campground.geometry = geoData.features[0].geometry; // Update geometry data
+    campground.location = geoData.features[0].place_name; // Standardize location name
+    
+    const imgs = req.files.map(f => ({url: f.path, filename: f.filename}));
+    campground.images.push(...imgs);
+    await campground.save();
+    // console.log(campground);
+    if(req.body.deleteImages){
+        for(let filename of req.body.deleteImages){
+            await cloudinary.uploader.destroy(filename); //to delete from cloudinary
+        }
+        await campground.updateOne({$pull: {images: {filename: {$in: req.body.deleteImages}}}}); //to delete from mongoDB
+        // console.log(campground);
+    }
+    req.flash('success', 'Successfully updated a campground!');
+    res.redirect(`/campgrounds/${campground._id}`);
+}
+
+module.exports.deleteCampground = async (req, res) => {
+    const { id } = req.params;
+    await Campground.findByIdAndDelete(id);
+    req.flash('success', 'Successfully deleted a campground!');
+    res.redirect('/campgrounds');
+}
+
+const Review = require('../models/review');
+const Campground = require('../models/campground');
+
+module.exports.createReview = async (req, res) => {
+    const campground = await Campground.findById(req.params.id);
+    const review = new Review(req.body.review);
+    review.author = req.user._id; // Associate the logged-in user as the author
+    campground.reviews.push(review);
+    await review.save();
+    await campground.save();
+    req.flash('success', 'Review added successfully!');
+    res.redirect(`/campgrounds/${campground._id}`);
+}
+
+module.exports.deleteReview = async(req, res) => {
+    const {id, reviewID} = req.params;
+    await Campground.findByIdAndUpdate(id, {$pull: {reviews: reviewID}}); //pull reviewID from review array
+    await Review.findByIdAndDelete(reviewID);
+    req.flash('success', 'Successfully deleted review');
+    res.redirect(`/campgrounds/${id}`);
+}
+const User = require('../models/user');
+
+
+module.exports.renderRegisterForm = (req, res) => {
+    if (req.query.returnTo) {
+        req.session.returnTo = req.query.returnTo;
+    }
+    res.render('../views/users/register');
+}
+
+module.exports.register = async (req, res, next) => {
+    try {
+        const {email, username, password} = req.body;
+        const user = new User({email, username});
+        const registeredUser = await User.register(user, password);
+        req.login(registeredUser, err => {
+            if(err) return next(err);
+            req.flash('success', 'Welcome to RiverRunCamp!');
+            
+            // Use stored returnTo URL or default to campgrounds
+            const redirectUrl = req.session.returnTo || '/campgrounds';
+            delete req.session.returnTo; // Clean up session
+            res.redirect(redirectUrl);
+        });
+    } catch (e) {
+        // Check for MongoDB duplicate key error (E11000)
+        //this is for unique email error handling
+        if (e.code === 11000 && e.keyPattern && e.keyPattern.email) {
+            req.flash('error', 'This email is already registered');
+        } else {
+            req.flash('error', e.message);
+        }
+        res.redirect('register');
+    }
+}
+
+module.exports.renderLoginForm = (req, res) => {
+    // Store returnTo in session if provided in query string
+    if (req.query.returnTo) {
+        req.session.returnTo = req.query.returnTo;
+    }
+    res.render('users/login');
+}
+
+module.exports.login = (req, res) => {
+    req.flash('success', 'Successfully logged in!');
+    const redirectUrl = req.session.returnTo || '/campgrounds'; // Default redirect URL
+    delete req.session.returnTo; // Clean up session
+    res.redirect(redirectUrl);
+}
+
+module.exports.logout = (req, res, next) => {
+    // Store current URL before logging out
+    const returnUrl = req.query.returnTo || req.headers.referer || '/campgrounds';
+    
+    req.logout(function (err) {
+        if (err) {
+            return next(err);
+        }
+        req.flash('success', 'Goodbye!');
+        res.redirect(returnUrl);
+    });
+}
